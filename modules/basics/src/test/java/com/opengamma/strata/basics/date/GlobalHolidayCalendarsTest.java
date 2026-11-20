@@ -1206,6 +1206,26 @@ public class GlobalHolidayCalendarsTest {
   }
 
   //-------------------------------------------------------------------------
+  public static Object[][] data_binaryFile() {
+    return new Object[][] {
+        {GBLO}, {FRPA}, {DEFR}, {CHZU}, {EUTA}, {USGS}, {USNY}, {NYFD}, {NYSE},
+        {JPTO}, {AUSY}, {BRBD}, {CAMO}, {CATO}, {CZPR}, {DKCO}, {HUBU}, {MXMC},
+        {NOOS}, {NZAU}, {NZWE}, {NZBD}, {PLWA}, {SEST}, {ZAJO},
+    };
+  }
+
+  @ParameterizedTest
+  @MethodSource("data_binaryFile")
+  public void test_binaryFileMatchesGeneratedCalendar(HolidayCalendar generated) {
+    // the calendars used at runtime are read from GlobalHolidayCalendars.bin,
+    // which must be regenerated whenever GlobalHolidayCalendars is changed
+    ImmutableHolidayCalendar expected = (ImmutableHolidayCalendar) generated;
+    ImmutableHolidayCalendar loaded = (ImmutableHolidayCalendar) HolidayCalendars.of(expected.getName());
+    assertThat(loaded.getWeekendDays()).isEqualTo(expected.getWeekendDays());
+    assertThat(loaded.getHolidays()).as(expected.getName()).containsExactlyElementsOf(expected.getHolidays());
+  }
+
+  //-------------------------------------------------------------------------
   private static List<LocalDate> mds(int year, MonthDay... monthDays) {
     List<LocalDate> holidays = new ArrayList<>();
     for (MonthDay md : monthDays) {

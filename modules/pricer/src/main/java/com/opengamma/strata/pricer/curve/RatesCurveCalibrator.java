@@ -9,6 +9,7 @@ import static com.opengamma.strata.collect.Guavate.filtering;
 import static com.opengamma.strata.collect.Guavate.toImmutableList;
 import static com.opengamma.strata.collect.Guavate.toImmutableMap;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
@@ -31,6 +32,9 @@ import com.opengamma.strata.market.curve.CurveParameterSize;
 import com.opengamma.strata.market.curve.JacobianCalibrationMatrix;
 import com.opengamma.strata.market.curve.RatesCurveGroupDefinition;
 import com.opengamma.strata.market.observable.IndexQuoteId;
+import com.opengamma.strata.math.MathException;
+import com.opengamma.strata.math.impl.linearalgebra.SVDecompositionCommons;
+import com.opengamma.strata.math.impl.linearalgebra.SVDecompositionResult;
 import com.opengamma.strata.math.impl.matrix.CommonsMatrixAlgebra;
 import com.opengamma.strata.math.impl.matrix.MatrixAlgebra;
 import com.opengamma.strata.math.rootfind.NewtonVectorRootFinder;
@@ -79,6 +83,8 @@ public final class RatesCurveCalibrator {
    * This is used to compute the present value sensitivity to market quotes stored in the metadata.
    */
   private final CalibrationMeasures pvMeasures;
+  // Absolute tolerance of the built-in root finder, or zero for a supplied root finder.
+  private final double splitTolerance;
 
   //-------------------------------------------------------------------------
   /**
@@ -154,7 +160,7 @@ public final class RatesCurveCalibrator {
       CalibrationMeasures pvMeasures) {
 
     NewtonVectorRootFinder rootFinder = NewtonVectorRootFinder.broyden(toleranceAbs, toleranceRel, stepMaximum);
-    return new RatesCurveCalibrator(rootFinder, measures, pvMeasures);
+    return new RatesCurveCalibrator(rootFinder, measures, pvMeasures, toleranceAbs);
   }
 
   /**
@@ -171,7 +177,7 @@ public final class RatesCurveCalibrator {
       CalibrationMeasures measures,
       CalibrationMeasures pvMeasures) {
 
-    return new RatesCurveCalibrator(rootFinder, measures, pvMeasures);
+    return new RatesCurveCalibrator(rootFinder, measures, pvMeasures, 0d);
   }
 
   //-------------------------------------------------------------------------
@@ -179,11 +185,13 @@ public final class RatesCurveCalibrator {
   private RatesCurveCalibrator(
       NewtonVectorRootFinder rootFinder,
       CalibrationMeasures measures,
-      CalibrationMeasures pvMeasures) {
+      CalibrationMeasures pvMeasures,
+      double splitTolerance) {
 
     this.rootFinder = ArgChecker.notNull(rootFinder, "rootFinder");
     this.measures = ArgChecker.notNull(measures, "measures");
     this.pvMeasures = ArgChecker.notNull(pvMeasures, "pvMeasures");
+    this.splitTolerance = splitTolerance;
   }
 
   //-------------------------------------------------------------------------
@@ -205,6 +213,8 @@ public final class RatesCurveCalibrator {
    * The valuation date is defined by the market data.
    * <p>
    * The Jacobian matrices are computed and stored in curve metadata.
+   * Proven independent currency blocks may be calibrated separately with the standard
+   * calibration measures. The Jacobian matrices retain the full calibration order.
    *
    * @param curveGroupDefn  the curve group definition
    * @param marketData  the market data required to build a trade for the instrument, including time-series
@@ -223,7 +233,9 @@ public final class RatesCurveCalibrator {
         .fxRateProvider(MarketDataFxRateProvider.of(marketData))
         .timeSeries(timeSeries)
         .build();
-    return calibrate(ImmutableList.of(curveGroupDefn), knownData, marketData, refData);
+    boolean allowSplit = splitTolerance > 0d && measures == CalibrationMeasures.PAR_SPREAD &&
+        pvMeasures == CalibrationMeasures.PRESENT_VALUE;
+    return calibrate(ImmutableList.of(curveGroupDefn), knownData, marketData, refData, allowSplit);
   }
 
   /**
@@ -245,6 +257,16 @@ public final class RatesCurveCalibrator {
       ImmutableRatesProvider knownData,
       MarketData marketData,
       ReferenceData refData) {
+
+    return calibrate(allGroupDefns, knownData, marketData, refData, false);
+  }
+
+  private ImmutableRatesProvider calibrate(
+      List<RatesCurveGroupDefinition> allGroupDefns,
+      ImmutableRatesProvider knownData,
+      MarketData marketData,
+      ReferenceData refData,
+      boolean allowSplit) {
 
     // this method effectively takes one CurveGroupDefinition
     // the list is a split of the definition, not multiple independent definitions
@@ -274,6 +296,16 @@ public final class RatesCurveCalibrator {
 
       // calibrate
       RatesProviderGenerator providerGenerator = ImmutableRatesProviderGenerator.of(providerCombined, groupDefnBound, refData);
+      if (allowSplit && orderGroup.size() > 1) {
+        List<List<Integer>> blocks = RatesCurveCalibrationBlocks.find(groupDefnBound, trades);
+        if (!blocks.isEmpty()) {
+          ImmutableRatesProvider splitProvider =
+              calibrateBlocks(groupDefnBound, knownData, refData, providerGenerator, trades, initialGuesses, orderGroup, blocks);
+          if (splitProvider != null) {
+            return splitProvider;
+          }
+        }
+      }
       DoubleArray calibratedGroupParams = calibrateGroup(providerGenerator, trades, initialGuesses, orderGroup);
       ImmutableRatesProvider calibratedProvider = providerGenerator.generate(calibratedGroupParams);
 
@@ -294,6 +326,98 @@ public final class RatesCurveCalibrator {
     }
     // return the calibrated provider
     return providerCombined;
+  }
+
+  // Calibrate each independent block, then put its parameters and Jacobian columns
+  // back in the order of the original group.
+  private ImmutableRatesProvider calibrateBlocks(
+      RatesCurveGroupDefinition definition,
+      ImmutableRatesProvider knownData,
+      ReferenceData refData,
+      RatesProviderGenerator fullGenerator,
+      ImmutableList<ResolvedTrade> trades,
+      ImmutableList<Double> initialGuesses,
+      ImmutableList<CurveParameterSize> order,
+      List<List<Integer>> blocks) {
+
+    int[] offsets = new int[order.size() + 1];
+    for (int i = 0; i < order.size(); i++) {
+      offsets[i + 1] = offsets[i] + order.get(i).getParameterCount();
+    }
+    int size = offsets[order.size()];
+    double[] parameters = new double[size];
+    Builder<CurveName, JacobianCalibrationMatrix> jacobians = ImmutableMap.builder();
+    double minSingular = Double.POSITIVE_INFINITY;
+    double maxSingular = 0d;
+    SVDecompositionCommons svd = new SVDecompositionCommons();
+    try {
+      for (List<Integer> block : blocks) {
+        RatesCurveGroupDefinition blockDefinition = definition.withCurveDefinitions(
+            block.stream().map(definition.getCurveDefinitions()::get).collect(toImmutableList()));
+        RatesProviderGenerator generator = ImmutableRatesProviderGenerator.of(knownData, blockDefinition, refData);
+        ImmutableList<CurveParameterSize> blockOrder = block.stream().map(order::get).collect(toImmutableList());
+        ImmutableList.Builder<ResolvedTrade> blockTradesBuilder = ImmutableList.builder();
+        ImmutableList.Builder<Double> guesses = ImmutableList.builder();
+        List<Integer> positions = new ArrayList<>();
+        for (int curve : block) {
+          blockTradesBuilder.addAll(trades.subList(offsets[curve], offsets[curve + 1]));
+          guesses.addAll(initialGuesses.subList(offsets[curve], offsets[curve + 1]));
+          for (int position = offsets[curve]; position < offsets[curve + 1]; position++) {
+            positions.add(position);
+          }
+        }
+        ImmutableList<ResolvedTrade> blockTrades = blockTradesBuilder.build();
+        DoubleArray blockParameters = calibrateGroup(generator, blockTrades, guesses.build(), blockOrder);
+        for (int i = 0; i < positions.size(); i++) {
+          parameters[positions.get(i)] = blockParameters.get(i);
+        }
+
+        ImmutableRatesProvider provider = generator.generate(blockParameters);
+        int blockSize = positions.size();
+        SVDecompositionResult blockSvd = svd.apply(derivatives(blockTrades, provider, blockOrder, blockSize));
+        double[] singularValues = blockSvd.getSingularValues();
+        maxSingular = Math.max(maxSingular, singularValues[0]);
+        minSingular = Math.min(minSingular, singularValues[singularValues.length - 1]);
+        if (definition.isComputeJacobian()) {
+          DoubleMatrix inverse = blockSvd.solve(DoubleMatrix.identity(blockSize));
+          int row = 0;
+          for (CurveParameterSize curve : blockOrder) {
+            double[][] values = new double[curve.getParameterCount()][size];
+            for (double[] curveRow : values) {
+              for (int column = 0; column < blockSize; column++) {
+                curveRow[positions.get(column)] = inverse.get(row, column);
+              }
+              row++;
+            }
+            jacobians.put(curve.getName(), JacobianCalibrationMatrix.of(order, DoubleMatrix.ofUnsafe(values)));
+          }
+        }
+      }
+      // Allow a margin around the dense solver's SVD rank cutoff.
+      double cutoff = Math.max(Math.sqrt(Double.MIN_NORMAL), 8d * size * Math.ulp(maxSingular));
+      if (!(minSingular > cutoff)) {
+        return null;
+      }
+      DoubleArray allParameters = DoubleArray.ofUnsafe(parameters);
+      ImmutableMap<CurveName, JacobianCalibrationMatrix> jacobianMap = jacobians.build();
+      ImmutableRatesProvider provider = fullGenerator.generate(allParameters, jacobianMap);
+      double residualSquared = 0d;
+      for (ResolvedTrade trade : trades) {
+        double residual = measures.value(trade, provider);
+        residualSquared += residual * residual;
+      }
+      if (!(Math.sqrt(residualSquared) < splitTolerance)) {
+        return null;
+      }
+      if (definition.isComputePvSensitivityToMarketQuote()) {
+        ImmutableMap<CurveName, DoubleArray> sensitivities = sensitivityToMarketQuoteForGroup(provider, trades, order);
+        return fullGenerator.generate(allParameters, jacobianMap, sensitivities);
+      }
+      return provider;
+    } catch (MathException | IllegalArgumentException ex) {
+      // Retry the joint solve if any part of the split calibration fails.
+      return null;
+    }
   }
 
   //-------------------------------------------------------------------------

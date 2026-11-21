@@ -89,6 +89,44 @@ public class SmithWilsonCurveFunctionTest {
   }
 
   @Test
+  public void test_largeAlpha() {
+    SmithWilsonCurveFunction function = SmithWilsonCurveFunction.of(0.03d);
+    DoubleArray nodes = DoubleArray.of(80d);
+    DoubleArray weights = DoubleArray.of(0.001d);
+    double[] xs = {79d, Math.nextDown(80d), 80d, Math.nextUp(80d), 81d, 100d};
+    // High-precision evaluation of the original formula; time derivative by central differences.
+    double[] values = {
+        0.17326557085063757, 0.16911178537707813, 0.16911178537707808,
+        0.16911178537707799, 0.16423181727389696, 0.093659111730376388};
+    double[] derivatives = {
+        -0.004153580621553529, -0.004528856337549400, -0.004528856337549465,
+        -0.004528856337549530, -0.004854475097143401, -0.002768451161756907};
+    double[] sensitivities = {
+        76.469161326664008, 75.134688751861049, 75.134688751861020,
+        75.134688751861006, 72.991917637763919, 41.626271880167280};
+    for (int i = 0; i < xs.length; i++) {
+      assertThat(function.value(xs[i], 10d, nodes, weights)).isCloseTo(values[i], offset(TOL));
+      assertThat(function.firstDerivative(xs[i], 10d, nodes, weights)).isCloseTo(derivatives[i], offset(TOL));
+      assertThat(function.parameterSensitivity(xs[i], 10d, nodes).get(0))
+          .isCloseTo(sensitivities[i], offset(3e-12));
+    }
+  }
+
+  @Test
+  public void test_smallAlphaAtNode() {
+    SmithWilsonCurveFunction function = SmithWilsonCurveFunction.of(0d);
+    DoubleArray nodes = DoubleArray.of(0.75d);
+    DoubleArray weights = DoubleArray.of(2d);
+    for (double x : new double[] {Math.nextDown(0.75d), 0.75d, Math.nextUp(0.75d)}) {
+      assertThat(function.value(x, 1e-12, nodes, weights)).isEqualTo(1d);
+      assertThat(function.firstDerivative(x, 1e-12, nodes, weights))
+          .isCloseTo(1.499999999998875e-24, offset(1e-36));
+      assertThat(function.parameterSensitivity(x, 1e-12, nodes).get(0))
+          .isCloseTo(5.624999999997188e-25, offset(1e-36));
+    }
+  }
+
+  @Test
   public void test_gap() {
     DoubleArray nodes = DoubleArray.of(3d, 5d, 7d, 10d, 15d, 20d, 30d);
     double testAlpha = 0.05;

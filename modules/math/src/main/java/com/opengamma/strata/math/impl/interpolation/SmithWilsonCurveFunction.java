@@ -88,10 +88,10 @@ public class SmithWilsonCurveFunction {
     double res = 1d;
     int bound = x < nodes.get(0) ? 0 : FunctionUtils.getLowerBoundIndex(nodes, x) + 1;
     for (int i = 0; i < bound; ++i) {
-      res += weights.get(i) * wilsonFunctionLeft(x, alpha, nodes.get(i));
+      res += weights.get(i) * wilsonFunction(nodes.get(i), x, alpha);
     }
     for (int i = bound; i < size; ++i) {
-      res += weights.get(i) * wilsonFunctionRight(x, alpha, nodes.get(i));
+      res += weights.get(i) * wilsonFunction(x, nodes.get(i), alpha);
     }
     res *= Math.exp(-omega * x);
     return res;
@@ -114,10 +114,10 @@ public class SmithWilsonCurveFunction {
     double res = -omega;
     int bound = x < nodes.get(0) ? 0 : FunctionUtils.getLowerBoundIndex(nodes, x) + 1;
     for (int i = 0; i < bound; ++i) {
-      res += weights.get(i) * wilsonFunctionLeftDerivative(x, alpha, nodes.get(i));
+      res += weights.get(i) * wilsonFunctionDerivative(nodes.get(i), x, alpha, false);
     }
     for (int i = bound; i < size; ++i) {
-      res += weights.get(i) * wilsonFunctionRightDerivative(x, alpha, nodes.get(i));
+      res += weights.get(i) * wilsonFunctionDerivative(x, nodes.get(i), alpha, true);
     }
     res *= Math.exp(-omega * x);
     return res;
@@ -139,39 +139,61 @@ public class SmithWilsonCurveFunction {
     double expOmega = Math.exp(-omega * x);
     int bound = x < nodes.get(0) ? 0 : FunctionUtils.getLowerBoundIndex(nodes, x) + 1;
     for (int i = 0; i < bound; ++i) {
-      res[i] = expOmega * wilsonFunctionLeft(x, alpha, nodes.get(i));
+      res[i] = expOmega * wilsonFunction(nodes.get(i), x, alpha);
     }
     for (int i = bound; i < size; ++i) {
-      res[i] = expOmega * wilsonFunctionRight(x, alpha, nodes.get(i));
+      res[i] = expOmega * wilsonFunction(x, nodes.get(i), alpha);
     }
     return DoubleArray.ofUnsafe(res);
   }
 
   //-------------------------------------------------------------------------
-  // x < node
-  private double wilsonFunctionRight(double x, double alpha, double node) {
-    double alphaX = alpha * x;
-    return alphaX - Math.exp(-alpha * node) * Math.sinh(alphaX);
+  private static double wilsonFunction(double lo, double hi, double alpha) {
+    double scaledLo = alpha * lo;
+    if (!useStableKernel(lo, hi, alpha)) {
+      return scaledLo - Math.exp(-alpha * hi) * Math.sinh(scaledLo);
+    }
+    double distance = alpha * (hi - lo);
+    double expDistance = Math.exp(-distance);
+    return wilsonKernel(scaledLo, distance, expDistance, scaledSinh(scaledLo, expDistance));
   }
 
-  // x < node, includes derivative of Math.exp(-omega * x)
-  private double wilsonFunctionRightDerivative(double x, double alpha, double node) {
-    double alphaX = alpha * x;
-    double expAlphaNode = Math.exp(-alpha * node);
-    return -omega * (alphaX - expAlphaNode * Math.sinh(alphaX)) + alpha * (1d - expAlphaNode * Math.cosh(alphaX));
+  // Includes the derivative of Math.exp(-omega * x).
+  private double wilsonFunctionDerivative(double lo, double hi, double alpha, boolean xIsLo) {
+    double scaledLo = alpha * lo;
+    if (!useStableKernel(lo, hi, alpha)) {
+      double expHi = Math.exp(-alpha * hi);
+      double sinh = Math.sinh(scaledLo);
+      double gradient = xIsLo ? alpha * (1d - expHi * Math.cosh(scaledLo)) : alpha * expHi * sinh;
+      return -omega * (scaledLo - expHi * sinh) + gradient;
+    }
+    double distance = alpha * (hi - lo);
+    double expDistance = Math.exp(-distance);
+    double sinh = scaledSinh(scaledLo, expDistance);
+    // 1 - exp(-alpha * hi) * cosh(alpha * lo) = 1 - exp(-distance) + sinh.
+    double gradient = xIsLo ? -Math.expm1(-distance) + sinh : sinh;
+    return -omega * wilsonKernel(scaledLo, distance, expDistance, sinh) + alpha * gradient;
   }
 
-  // x > node
-  private double wilsonFunctionLeft(double x, double alpha, double node) {
-    double alphaNode = alpha * node;
-    return alphaNode - Math.exp(-alpha * x) * Math.sinh(alphaNode);
+  // Keep the original calculation outside the non-negative finite inputs.
+  private static boolean useStableKernel(double lo, double hi, double alpha) {
+    return lo >= 0d && Double.isFinite(hi) && alpha >= 0d && Double.isFinite(alpha);
   }
 
-  // x > node, includes derivative of Math.exp(-omega * x)
-  private double wilsonFunctionLeftDerivative(double x, double alpha, double node) {
-    double alphaNode = alpha * node;
-    double expAlphaX = Math.exp(-alpha * x);
-    return -omega * (alphaNode - expAlphaX * Math.sinh(alphaNode)) + alpha * expAlphaX * Math.sinh(alphaNode);
+  // exp(-alpha * hi) * sinh(alpha * lo), without an overflowing intermediate.
+  private static double scaledSinh(double scaledLo, double expDistance) {
+    return -0.5d * expDistance * Math.expm1(-2d * scaledLo);
+  }
+
+  private static double wilsonKernel(double scaledLo, double distance, double expDistance, double sinh) {
+    if (scaledLo < 0.01d) {
+      // Half of exp(-2 * scaledLo) - 1 + 2 * scaledLo (terms through degree 8).
+      // This avoids cancellation of the linear terms when distance is also small.
+      double remainder = scaledLo * scaledLo * (1d + scaledLo * (-2d / 3d + scaledLo *
+          (1d / 3d + scaledLo * (-2d / 15d + scaledLo * (2d / 45d + scaledLo * (-4d / 315d + scaledLo / 315d))))));
+      return -scaledLo * Math.expm1(-distance) + expDistance * remainder;
+    }
+    return scaledLo - sinh;
   }
 
 }

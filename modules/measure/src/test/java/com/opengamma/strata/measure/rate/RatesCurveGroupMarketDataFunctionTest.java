@@ -6,6 +6,7 @@
 package com.opengamma.strata.measure.rate;
 
 import static com.opengamma.strata.basics.date.DayCounts.ACT_360;
+import static com.opengamma.strata.basics.date.DayCounts.ACT_ACT_ISDA;
 import static com.opengamma.strata.collect.Guavate.casting;
 import static com.opengamma.strata.collect.Guavate.toImmutableList;
 import static com.opengamma.strata.collect.TestHelper.date;
@@ -17,11 +18,13 @@ import java.time.LocalDate;
 import java.time.Period;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.junit.jupiter.api.Test;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.opengamma.strata.basics.ReferenceData;
 import com.opengamma.strata.basics.StandardId;
 import com.opengamma.strata.basics.currency.Currency;
@@ -47,6 +50,7 @@ import com.opengamma.strata.market.curve.CurveGroupName;
 import com.opengamma.strata.market.curve.CurveId;
 import com.opengamma.strata.market.curve.CurveName;
 import com.opengamma.strata.market.curve.CurveNode;
+import com.opengamma.strata.market.curve.CurveNodeDateOrder;
 import com.opengamma.strata.market.curve.DefaultCurveMetadata;
 import com.opengamma.strata.market.curve.InterpolatedNodalCurveDefinition;
 import com.opengamma.strata.market.curve.RatesCurveGroup;
@@ -61,15 +65,19 @@ import com.opengamma.strata.market.curve.node.FraCurveNode;
 import com.opengamma.strata.market.curve.node.FxSwapCurveNode;
 import com.opengamma.strata.market.observable.IndexQuoteId;
 import com.opengamma.strata.market.observable.QuoteId;
+import com.opengamma.strata.market.param.DatedParameterMetadata;
 import com.opengamma.strata.market.param.ParameterMetadata;
 import com.opengamma.strata.measure.curve.TestMarketDataMap;
 import com.opengamma.strata.pricer.curve.RatesCurveCalibrator;
 import com.opengamma.strata.pricer.fra.DiscountingFraTradePricer;
 import com.opengamma.strata.pricer.rate.RatesProvider;
 import com.opengamma.strata.pricer.swap.DiscountingSwapTradePricer;
+import com.opengamma.strata.product.fra.FraTrade;
 import com.opengamma.strata.product.fra.ResolvedFraTrade;
+import com.opengamma.strata.product.fra.type.FraTemplate;
 import com.opengamma.strata.product.fx.type.FxSwapConventions;
 import com.opengamma.strata.product.fx.type.FxSwapTemplate;
+import com.opengamma.strata.product.rate.IborRateComputation;
 import com.opengamma.strata.product.swap.ResolvedSwapTrade;
 
 /**
@@ -387,6 +395,164 @@ public class RatesCurveGroupMarketDataFunctionTest {
     MultiCurrencyAmount amount = DiscountingSwapTradePricer.DEFAULT.presentValue(trade, ratesProvider);
     double pv = amount.getAmount(Currency.USD).getAmount();
     assertThat(pv).isCloseTo(0, offset(PV_TOLERANCE));
+  }
+
+  @Test
+  public void calibratesCurveNodesWithoutInputQuotes() {
+    CurveGroupName groupName = CurveGroupName.of("Fixed quotes");
+    CurveName fixedName = CurveName.of("Fixed USD rates");
+    FraCurveNode first = CurveTestUtils.fraNode(1, "fixed1");
+    FraCurveNode second = CurveTestUtils.fraNode(6, "fixed2");
+    InterpolatedNodalCurveDefinition fixed = CurveTestUtils.fraCurveDefinition().toBuilder()
+        .name(fixedName)
+        .nodes(ImmutableList.of(new FixedQuoteFraNode(first, 0.013), new FixedQuoteFraNode(second, 0.021)))
+        .interpolator(CurveInterpolators.LINEAR)
+        .build();
+    RatesCurveGroupDefinition groupDefn = RatesCurveGroupDefinition.builder()
+        .name(groupName)
+        .addCurve(fixed, Currency.USD, IborIndices.USD_LIBOR_3M)
+        .build();
+    RatesCurveGroupMarketDataFunction function = new RatesCurveGroupMarketDataFunction();
+    RatesCurveGroupId groupId = RatesCurveGroupId.of(groupName, ObservableSource.NONE);
+    MarketDataConfig config = MarketDataConfig.builder().add(groupName, groupDefn).build();
+    assertThat(function.requirements(groupId, config).getNonObservables()).isEmpty();
+
+    LocalDate valuationDate = date(2011, 3, 8);
+    MarketDataBox<RatesCurveGroup> single = function.build(
+        groupId, config, ImmutableScenarioMarketData.builder(valuationDate).build(), REF_DATA);
+    assertThat(single.isSingleValue()).isTrue();
+    assertFraPar(single.getSingleValue(), Currency.USD, first, valuationDate, 0.013);
+    assertFraPar(single.getSingleValue(), Currency.USD, second, valuationDate, 0.021);
+
+    LocalDate next = valuationDate.plusDays(1);
+    ScenarioMarketData dates = ImmutableScenarioMarketData.of(
+        2, MarketDataBox.ofScenarioValues(valuationDate, next), ImmutableMap.of(), ImmutableMap.of());
+    MarketDataBox<RatesCurveGroup> multi = function.build(groupId, config, dates, REF_DATA);
+    assertThat(multi.getScenarioCount()).isEqualTo(2);
+    assertFraPar(multi.getValue(0), Currency.USD, first, valuationDate, 0.013);
+    assertFraPar(multi.getValue(1), Currency.USD, first, next, 0.013);
+  }
+
+  @Test
+  public void calibratesMixedFixedAndScenarioQuotes() {
+    CurveGroupName groupName = CurveGroupName.of("Mixed quotes");
+    CurveName fixedName = CurveName.of("Fixed USD rates");
+    CurveName scenarioName = CurveName.of("Scenario EUR rates");
+    FraCurveNode usd1 = CurveTestUtils.fraNode(1, "fixed1");
+    FraCurveNode usd2 = CurveTestUtils.fraNode(6, "fixed2");
+    FraCurveNode eur1 = FraCurveNode.of(
+        FraTemplate.of(Period.ofMonths(1), IborIndices.EUR_EURIBOR_3M),
+        QuoteId.of(StandardId.of("test", "market1")));
+    FraCurveNode eur2 = FraCurveNode.of(
+        FraTemplate.of(Period.ofMonths(6), IborIndices.EUR_EURIBOR_3M),
+        QuoteId.of(StandardId.of("test", "market2")));
+    InterpolatedNodalCurveDefinition shape = CurveTestUtils.fraCurveDefinition().toBuilder()
+        .interpolator(CurveInterpolators.LINEAR)
+        .build();
+    RatesCurveGroupDefinition groupDefn = RatesCurveGroupDefinition.builder()
+        .name(groupName)
+        .addCurve(shape.toBuilder()
+            .name(fixedName)
+            .nodes(ImmutableList.of(new FixedQuoteFraNode(usd1, 0.013), new FixedQuoteFraNode(usd2, 0.021)))
+            .build(), Currency.USD, IborIndices.USD_LIBOR_3M)
+        .addCurve(shape.toBuilder()
+            .name(scenarioName)
+            .nodes(ImmutableList.of(eur1, eur2))
+            .build(), Currency.EUR, IborIndices.EUR_EURIBOR_3M)
+        .build();
+    RatesCurveGroupMarketDataFunction function = new RatesCurveGroupMarketDataFunction();
+    RatesCurveGroupId groupId = RatesCurveGroupId.of(groupName, ObservableSource.NONE);
+    RatesCurveInputsId observedId = RatesCurveInputsId.of(groupName, scenarioName, ObservableSource.NONE);
+    MarketDataConfig config = MarketDataConfig.builder().add(groupName, groupDefn).build();
+    assertThat(function.requirements(groupId, config).getNonObservables()).containsExactly(observedId);
+
+    LocalDate valuationDate = date(2011, 3, 8);
+    DefaultCurveMetadata metadata = DefaultCurveMetadata.of(scenarioName);
+    RatesCurveInputs first = RatesCurveInputs.of(
+        ImmutableMap.of(eur1.getRateId(), 0.008, eur2.getRateId(), 0.017), metadata);
+    RatesCurveInputs second = RatesCurveInputs.of(
+        ImmutableMap.of(eur1.getRateId(), 0.014, eur2.getRateId(), 0.023), metadata);
+    ScenarioMarketData inputs = ImmutableScenarioMarketData.of(
+        2,
+        valuationDate,
+        ImmutableMap.of(observedId, MarketDataBox.ofScenarioValues(first, second)),
+        ImmutableMap.of());
+
+    MarketDataBox<RatesCurveGroup> result = function.build(groupId, config, inputs, REF_DATA);
+    assertThat(result.getScenarioCount()).isEqualTo(2);
+    assertFraPar(result.getValue(0), Currency.USD, usd1, valuationDate, 0.013);
+    assertFraPar(result.getValue(1), Currency.USD, usd2, valuationDate, 0.021);
+    assertFraPar(result.getValue(0), Currency.EUR, eur1, valuationDate, 0.008);
+    assertFraPar(result.getValue(0), Currency.EUR, eur2, valuationDate, 0.017);
+    assertFraPar(result.getValue(1), Currency.EUR, eur1, valuationDate, 0.014);
+    assertFraPar(result.getValue(1), Currency.EUR, eur2, valuationDate, 0.023);
+  }
+
+  private void assertFraPar(
+      RatesCurveGroup group, Currency currency, FraCurveNode node, LocalDate valuationDate, double targetRate) {
+
+    ResolvedFraTrade trade = new FixedQuoteFraNode(node, targetRate).resolvedTrade(
+        1d, ImmutableMarketData.of(valuationDate, ImmutableMap.of()), REF_DATA);
+    IborRateComputation rate = (IborRateComputation) trade.getProduct().getFloatingRate();
+    double start = ACT_ACT_ISDA.yearFraction(valuationDate, rate.getEffectiveDate());
+    double end = ACT_ACT_ISDA.yearFraction(valuationDate, rate.getMaturityDate());
+    Curve curve = group.findDiscountCurve(currency).get();
+    double forward = Math.expm1(end * curve.yValue(end) - start * curve.yValue(start)) / rate.getYearFraction();
+    assertThat(forward).isCloseTo(targetRate, offset(PV_TOLERANCE));
+  }
+
+  private static final class FixedQuoteFraNode implements CurveNode {
+    private final FraCurveNode node;
+    private final double rate;
+
+    private FixedQuoteFraNode(FraCurveNode node, double rate) {
+      this.node = node;
+      this.rate = rate;
+    }
+
+    @Override
+    public String getLabel() {
+      return node.getLabel();
+    }
+
+    @Override
+    public CurveNodeDateOrder getDateOrder() {
+      return node.getDateOrder();
+    }
+
+    @Override
+    public Set<? extends MarketDataId<?>> requirements() {
+      return ImmutableSet.of();
+    }
+
+    @Override
+    public LocalDate date(LocalDate valuationDate, ReferenceData refData) {
+      return node.date(valuationDate, refData);
+    }
+
+    @Override
+    public DatedParameterMetadata metadata(LocalDate valuationDate, ReferenceData refData) {
+      return node.metadata(valuationDate, refData);
+    }
+
+    @Override
+    public FraTrade trade(double quantity, MarketData marketData, ReferenceData refData) {
+      return node.trade(quantity, withQuote(marketData), refData);
+    }
+
+    @Override
+    public ResolvedFraTrade resolvedTrade(double quantity, MarketData marketData, ReferenceData refData) {
+      return node.resolvedTrade(quantity, withQuote(marketData), refData);
+    }
+
+    @Override
+    public double initialGuess(MarketData marketData, ValueType valueType) {
+      return node.initialGuess(withQuote(marketData), valueType);
+    }
+
+    private MarketData withQuote(MarketData marketData) {
+      return ImmutableMarketData.of(marketData.getValuationDate(), ImmutableMap.of(node.getRateId(), rate));
+    }
   }
 
 }

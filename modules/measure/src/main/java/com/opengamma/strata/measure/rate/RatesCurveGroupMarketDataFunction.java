@@ -144,7 +144,9 @@ public class RatesCurveGroupMarketDataFunction implements MarketDataFunction<Rat
     CurveGroupName groupName = configuredGroup.getName();
 
     List<MarketDataBox<RatesCurveInputs>> inputBoxes = configuredGroup.getCurveDefinitions().stream()
-        .map(curveDefn -> curveInputs(curveDefn, marketData, groupName, obsSource))
+        .filter(this::requiresMarketData)
+        .map(curveDefn -> RatesCurveInputsId.of(groupName, curveDefn.getName(), obsSource))
+        .map(marketData::getValue)
         .collect(toImmutableList());
     MarketDataBox<LocalDate> valuationDates = marketData.getValuationDate();
     // If any of the inputs have values for multiple scenarios then we need to build a curve group for each scenario.
@@ -300,34 +302,6 @@ public class RatesCurveGroupMarketDataFunction implements MarketDataFunction<Rat
     // This shouldn't happen, this method is only called after checking at least one of the values contains data
     // for multiple scenarios.
     throw new IllegalArgumentException("Cannot count the scenarios, all data contained single values");
-  }
-
-  /**
-   * Returns the inputs required for the curve if available.
-   * <p>
-   * If no market data is required to build the curve an empty set of inputs is returned.
-   * If the curve requires inputs which are available in {@code marketData} they are returned.
-   * If the curve requires inputs which are not available in {@code marketData} an exception is thrown
-   *
-   * @param curveDefn  the curve definition
-   * @param marketData  the market data
-   * @param groupName  the name of the curve group being built
-   * @param obsSource  the source of the observable market data
-   * @return the input data required for the curve if available
-   */
-  private MarketDataBox<RatesCurveInputs> curveInputs(
-      CurveDefinition curveDefn,
-      ScenarioMarketData marketData,
-      CurveGroupName groupName,
-      ObservableSource obsSource) {
-
-    // only try to get inputs from the market data if the curve needs market data
-    if (requiresMarketData(curveDefn)) {
-      RatesCurveInputsId curveInputsId = RatesCurveInputsId.of(groupName, curveDefn.getName(), obsSource);
-      return marketData.getValue(curveInputsId);
-    } else {
-      return MarketDataBox.ofSingleValue(RatesCurveInputs.builder().build());
-    }
   }
 
   /**

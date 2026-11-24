@@ -26,6 +26,7 @@ import static com.opengamma.strata.product.bond.CapitalIndexedBondYieldConventio
 import static com.opengamma.strata.product.swap.PriceIndexCalculationMethod.INTERPOLATED;
 import static com.opengamma.strata.product.swap.PriceIndexCalculationMethod.INTERPOLATED_JAPAN;
 import static com.opengamma.strata.product.swap.PriceIndexCalculationMethod.MONTHLY;
+import static java.time.temporal.ChronoUnit.DAYS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.data.Offset.offset;
 
@@ -486,6 +487,27 @@ public class DiscountingCapitalIndexedBondProductPricerTest {
     double dw1 = PRICER.modifiedDurationFromStandardYield(PRODUCT, RATES_PROVIDER, VALUATION, yield - EPS);
     double expected1 = -0.5 * (up1 - dw1) / EPS + md1 * md1;
     assertThat(computed1).isCloseTo(expected1, offset(EPS));
+  }
+
+  @Test
+  public void test_standardYield_settleBeforeStart() {
+    double yield = 0.0175;
+    LocalDate settlement = START.minusDays(10);
+    double factorToStart = 10d / DAYS.between(START.minusMonths(6), START);
+    double timeToStart = 0.5 * factorToStart;
+    double factorOnPeriod = 1d + 0.5 * yield;
+    // all cash flows are discounted from the start date over the time to the start date
+    double priceStart = PRICER.dirtyPriceFromStandardYield(PRODUCT, RATES_PROVIDER, START, yield);
+    double price = PRICER.dirtyPriceFromStandardYield(PRODUCT, RATES_PROVIDER, settlement, yield);
+    assertThat(price).isCloseTo(priceStart * Math.pow(factorOnPeriod, -factorToStart), offset(TOL));
+    double mdStart = PRICER.modifiedDurationFromStandardYield(PRODUCT, RATES_PROVIDER, START, yield);
+    double md = PRICER.modifiedDurationFromStandardYield(PRODUCT, RATES_PROVIDER, settlement, yield);
+    assertThat(md).isCloseTo(mdStart + timeToStart / factorOnPeriod, offset(TOL));
+    double cvStart = PRICER.convexityFromStandardYield(PRODUCT, RATES_PROVIDER, START, yield);
+    double cv = PRICER.convexityFromStandardYield(PRODUCT, RATES_PROVIDER, settlement, yield);
+    double cvExpected = cvStart +
+        timeToStart * (2d * mdStart * factorOnPeriod + timeToStart + 0.5) / (factorOnPeriod * factorOnPeriod);
+    assertThat(cv).isCloseTo(cvExpected, offset(TOL));
   }
 
   //-------------------------------------------------------------------------

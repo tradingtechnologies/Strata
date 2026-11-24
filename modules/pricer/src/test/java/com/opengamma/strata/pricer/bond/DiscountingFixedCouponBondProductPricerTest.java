@@ -15,6 +15,7 @@ import static com.opengamma.strata.basics.date.HolidayCalendarIds.SAT_SUN;
 import static com.opengamma.strata.collect.TestHelper.date;
 import static com.opengamma.strata.pricer.CompoundedRateType.CONTINUOUS;
 import static com.opengamma.strata.pricer.CompoundedRateType.PERIODIC;
+import static java.time.temporal.ChronoUnit.DAYS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import static org.assertj.core.api.Assertions.offset;
@@ -23,6 +24,7 @@ import java.time.LocalDate;
 import java.time.Month;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.function.Function;
 
 import org.junit.jupiter.api.Test;
 
@@ -1099,6 +1101,123 @@ public class DiscountingFixedCouponBondProductPricerTest {
       double dirtyPriceY = PRICER.dirtyPriceFromYield(bond, settlement, yield);
       assertThat(dirtyPriceY).isCloseTo(dirtyPrice, offset(TOL));
       assertThat(yield).as(date.format(DateTimeFormatter.ISO_DATE)).isCloseTo(.007, offset(1e-3));
+    }
+  }
+
+  //-------------------------------------------------------------------------
+  @Test
+  public void yieldFunctions_settleBeforeStartUS() {
+    LocalDate settlement = START_US.minusDays(10);
+    double factorToStart = 10d / DAYS.between(START_US.minusMonths(6), START_US);
+    assertYieldFunctionsBeforeStart(PRODUCT_US, settlement, YIELD_US, factorToStart);
+  }
+
+  @Test
+  public void yieldFunctions_settleBeforeStartUK() {
+    LocalDate settlement = START_UK.minusDays(5);
+    double factorToStart = 5d / DAYS.between(START_UK.minusMonths(6), START_UK);
+    assertYieldFunctionsBeforeStart(PRODUCT_UK, settlement, YIELD_UK, factorToStart);
+    // the start date is a Saturday, the yield functions use the unadjusted start date
+    LocalDate startAdjusted = PRODUCT_UK.getStartDate();
+    double factorToStartAdjusted = 2d / DAYS.between(START_UK, START_UK.plusMonths(6));
+    double price = PRICER.dirtyPriceFromYield(PRODUCT_UK, START_UK, YIELD_UK);
+    double priceAdjusted = PRICER.dirtyPriceFromYield(PRODUCT_UK, startAdjusted, YIELD_UK);
+    assertThat(price).isCloseTo(priceAdjusted * Math.pow(1d + 0.5 * YIELD_UK, -factorToStartAdjusted), offset(TOL));
+  }
+
+  @Test
+  public void yieldFunctions_settleBeforeStartGER() {
+    LocalDate settlement = START_GER.minusDays(30);
+    double factorToStart = 30d / DAYS.between(START_GER.minusYears(1), START_GER);
+    assertYieldFunctionsBeforeStart(PRODUCT_GER, settlement, YIELD_GER, factorToStart);
+  }
+
+  @Test
+  public void yieldFunctions_settleBeforeStart_act365F() {
+    LocalDate settlement = START_DATE.minusDays(5);
+    double factorToStart = 5d / 365d * 2d;
+    assertYieldFunctionsBeforeStart(PRODUCT, settlement, 0.02, factorToStart);
+  }
+
+  @Test
+  public void yieldFunctions_settleBeforeStart_singlePeriod() {
+    ResolvedFixedCouponBond bond = FixedCouponBond.builder()
+        .securityId(SECURITY_ID)
+        .dayCount(DayCounts.ACT_ACT_ICMA)
+        .fixedRate(0.04625)
+        .legalEntityId(ISSUER_ID)
+        .currency(Currency.USD)
+        .notional(100)
+        .accrualSchedule(SCHEDULE_US.toBuilder().endDate(START_US.plusMonths(6)).build())
+        .settlementDateOffset(DaysAdjustment.ofBusinessDays(3, SAT_SUN))
+        .yieldConvention(FixedCouponBondYieldConvention.US_STREET)
+        .exCouponPeriod(DaysAdjustment.NONE)
+        .build()
+        .resolve(REF_DATA);
+    LocalDate settlement = START_US.minusDays(10);
+    // one coupon left, simple interest over the first period and the time to the start date
+    double factorToCoupon = 1d + 10d / DAYS.between(START_US.minusMonths(6), START_US);
+    double price = PRICER.dirtyPriceFromYield(bond, settlement, YIELD_US);
+    assertThat(price).isCloseTo((1d + 0.5 * 0.04625) / (1d + factorToCoupon * 0.5 * YIELD_US), offset(TOL));
+    assertThat(PRICER.dirtyPriceFromYieldAd(bond, settlement, YIELD_US).getValue()).isCloseTo(price, offset(TOL));
+    assertThat(PRICER.yieldFromDirtyPrice(bond, settlement, price)).isCloseTo(YIELD_US, offset(TOL));
+  }
+
+  @Test
+  public void yieldFunctions_acrossStart() {
+    assertContinuousAcrossStart(PRODUCT_US, YIELD_US);
+    assertContinuousAcrossStart(PRODUCT_UK, YIELD_UK);
+    assertContinuousAcrossStart(PRODUCT_GER, YIELD_GER);
+  }
+
+  // settlement before the start, all cash flows are discounted from the start date over the time to the start date
+  private static void assertYieldFunctionsBeforeStart(
+      ResolvedFixedCouponBond bond,
+      LocalDate settlement,
+      double yield,
+      double factorToStart) {
+
+    LocalDate start = bond.getUnadjustedStartDate();
+    double eventsPerYear = bond.getFrequency().eventsPerYear();
+    double factorOnPeriod = 1d + yield / eventsPerYear;
+    double timeToStart = factorToStart / eventsPerYear;
+    // price and yield
+    double priceStart = PRICER.dirtyPriceFromYield(bond, start, yield);
+    double price = PRICER.dirtyPriceFromYield(bond, settlement, yield);
+    assertThat(price).isCloseTo(priceStart * Math.pow(factorOnPeriod, -factorToStart), offset(TOL));
+    ValueDerivatives priceAd = PRICER.dirtyPriceFromYieldAd(bond, settlement, yield);
+    assertThat(priceAd.getValue()).isCloseTo(price, offset(TOL));
+    double priceUp = PRICER.dirtyPriceFromYield(bond, settlement, yield + EPS);
+    double priceDw = PRICER.dirtyPriceFromYield(bond, settlement, yield - EPS);
+    assertThat(priceAd.getDerivative(0)).isCloseTo(0.5 * (priceUp - priceDw) / EPS, offset(EPS));
+    assertThat(PRICER.yieldFromDirtyPrice(bond, settlement, price)).isCloseTo(yield, offset(TOL));
+    // durations and convexity, the times to the cash flows are increased by the time to the start date
+    double macaulayStart = PRICER.macaulayDurationFromYield(bond, start, yield);
+    double macaulay = PRICER.macaulayDurationFromYield(bond, settlement, yield);
+    assertThat(macaulay).isCloseTo(macaulayStart + timeToStart, offset(TOL));
+    double modified = PRICER.modifiedDurationFromYield(bond, settlement, yield);
+    assertThat(modified).isCloseTo(0.5 * (priceDw - priceUp) / price / EPS, offset(EPS));
+    assertThat(PRICER.modifiedDurationFromYieldAd(bond, settlement, yield).getValue()).isCloseTo(modified, offset(TOL));
+    double convexityStart = PRICER.convexityFromYield(bond, start, yield);
+    double convexity = PRICER.convexityFromYield(bond, settlement, yield);
+    double convexityExpected = convexityStart +
+        timeToStart * (2d * macaulayStart + timeToStart + 1d / eventsPerYear) / (factorOnPeriod * factorOnPeriod);
+    assertThat(convexity).isCloseTo(convexityExpected, offset(TOL));
+  }
+
+  // the change over the day before the start date is similar to the change over the day after the start date
+  private static void assertContinuousAcrossStart(ResolvedFixedCouponBond bond, double yield) {
+    LocalDate start = bond.getUnadjustedStartDate();
+    List<Function<LocalDate, Double>> functions = ImmutableList.of(
+        date -> PRICER.dirtyPriceFromYield(bond, date, yield),
+        date -> PRICER.modifiedDurationFromYield(bond, date, yield),
+        date -> PRICER.macaulayDurationFromYield(bond, date, yield),
+        date -> PRICER.convexityFromYield(bond, date, yield));
+    for (Function<LocalDate, Double> function : functions) {
+      double valueStart = function.apply(start);
+      double changeBefore = Math.abs(valueStart - function.apply(start.minusDays(1)));
+      double changeAfter = Math.abs(function.apply(start.plusDays(1)) - valueStart);
+      assertThat(changeBefore).isLessThan(2d * changeAfter);
     }
   }
 

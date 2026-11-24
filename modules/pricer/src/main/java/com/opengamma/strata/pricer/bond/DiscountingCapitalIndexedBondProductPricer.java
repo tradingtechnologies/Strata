@@ -16,6 +16,9 @@ import com.opengamma.strata.basics.ReferenceData;
 import com.opengamma.strata.basics.currency.Currency;
 import com.opengamma.strata.basics.currency.CurrencyAmount;
 import com.opengamma.strata.basics.currency.MultiCurrencyAmount;
+import com.opengamma.strata.basics.date.DayCount.ScheduleInfo;
+import com.opengamma.strata.basics.schedule.Frequency;
+import com.opengamma.strata.basics.schedule.RollConventions;
 import com.opengamma.strata.basics.value.ValueDerivatives;
 import com.opengamma.strata.collect.ArgChecker;
 import com.opengamma.strata.collect.array.DoubleArray;
@@ -1381,7 +1384,10 @@ public class DiscountingCapitalIndexedBondProductPricer {
 
   private double factorToNextCoupon(ResolvedCapitalIndexedBond bond, LocalDate settlementDate) {
     if (bond.getUnadjustedStartDate().isAfter(settlementDate)) {
-      return 0d;
+      // settlement before the start, the time to the first coupon includes the time to the start date
+      CapitalIndexedBondPaymentPeriod firstPeriod = bond.getPeriodicPayments().get(0);
+      double factorPeriod = bond.yearFraction(firstPeriod.getUnadjustedStartDate(), firstPeriod.getUnadjustedEndDate());
+      return (factorPeriod + yearFractionToStart(bond, settlementDate)) / factorPeriod;
     }
     int periodIndex = bond.findPeriodIndex(settlementDate)
         .orElseThrow(() -> new IllegalArgumentException("Date outside range of bond"));
@@ -1390,6 +1396,43 @@ public class DiscountingCapitalIndexedBondProductPricer {
     double factorSpot = bond.yearFraction(previousAccrualDate, settlementDate);
     double factorPeriod = bond.yearFraction(previousAccrualDate, period.getUnadjustedEndDate());
     return (factorPeriod - factorSpot) / factorPeriod;
+  }
+
+  // Year fraction from a settlement date before the start of the bond to the start date.
+  // The first period is extended back to the settlement date, so that day counts such as Act/Act ICMA
+  // measure the time in notional periods ending on the first coupon date.
+  private double yearFractionToStart(ResolvedCapitalIndexedBond bond, LocalDate settlementDate) {
+    LocalDate firstCouponDate = bond.getPeriodicPayments().get(0).getUnadjustedEndDate();
+    ScheduleInfo info = new ScheduleInfo() {
+      @Override
+      public LocalDate getStartDate() {
+        return settlementDate;
+      }
+
+      @Override
+      public LocalDate getEndDate() {
+        // a single period bond is treated like the first period of a longer bond,
+        // so that Act/Act ICMA also measures the time backwards from the first coupon date
+        LocalDate endDate = bond.getUnadjustedEndDate();
+        return endDate.equals(firstCouponDate) ? endDate.plus(bond.getFrequency()) : endDate;
+      }
+
+      @Override
+      public Frequency getFrequency() {
+        return bond.getFrequency();
+      }
+
+      @Override
+      public LocalDate getPeriodEndDate(LocalDate date) {
+        return firstCouponDate;
+      }
+
+      @Override
+      public boolean isEndOfMonthConvention() {
+        return bond.getRollConvention() == RollConventions.EOM;
+      }
+    };
+    return bond.getDayCount().yearFraction(settlementDate, bond.getUnadjustedStartDate(), info);
   }
 
   double indexRatio(ResolvedCapitalIndexedBond bond, RatesProvider ratesProvider, LocalDate settlementDate) {

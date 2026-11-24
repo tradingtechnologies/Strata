@@ -19,6 +19,9 @@ import com.google.common.collect.ImmutableList;
 import com.opengamma.strata.basics.ReferenceData;
 import com.opengamma.strata.basics.currency.CurrencyAmount;
 import com.opengamma.strata.basics.currency.Payment;
+import com.opengamma.strata.basics.date.DayCount.ScheduleInfo;
+import com.opengamma.strata.basics.schedule.Frequency;
+import com.opengamma.strata.basics.schedule.RollConventions;
 import com.opengamma.strata.basics.value.ValueDerivatives;
 import com.opengamma.strata.collect.ArgChecker;
 import com.opengamma.strata.collect.array.DoubleArray;
@@ -1064,14 +1067,53 @@ public class DiscountingFixedCouponBondProductPricer {
   //-------------------------------------------------------------------------
   // Accrual factor to the next coupon
   private double factorToNextCoupon(ResolvedFixedCouponBond bond, LocalDate settlementDate) {
-    if (bond.getPeriodicPayments().get(0).getStartDate().isAfter(settlementDate)) {
-      return 0d;
+    double eventsPerYear = bond.getFrequency().eventsPerYear();
+    if (bond.getUnadjustedStartDate().isAfter(settlementDate)) {
+      // settlement before the start, the time to the first coupon includes the time to the start date
+      double factorPeriod = bond.getPeriodicPayments().get(0).getYearFraction();
+      return (factorPeriod + yearFractionToStart(bond, settlementDate)) * eventsPerYear;
     }
     int couponIndex = couponIndex(bond.getPeriodicPayments(), settlementDate);
     double factorSpot = accruedYearFraction(bond, settlementDate);
     double factorPeriod = bond.getPeriodicPayments().get(couponIndex).getYearFraction();
-    double eventsPerYear = bond.getFrequency().eventsPerYear();
     return (factorPeriod - factorSpot) * eventsPerYear;
+  }
+
+  // Year fraction from a settlement date before the start of the bond to the start date.
+  // The first period is extended back to the settlement date, so that day counts such as Act/Act ICMA
+  // measure the time in notional periods ending on the first coupon date.
+  private double yearFractionToStart(ResolvedFixedCouponBond bond, LocalDate settlementDate) {
+    LocalDate firstCouponDate = bond.getPeriodicPayments().get(0).getUnadjustedEndDate();
+    ScheduleInfo info = new ScheduleInfo() {
+      @Override
+      public LocalDate getStartDate() {
+        return settlementDate;
+      }
+
+      @Override
+      public LocalDate getEndDate() {
+        // a single period bond is treated like the first period of a longer bond,
+        // so that Act/Act ICMA also measures the time backwards from the first coupon date
+        LocalDate endDate = bond.getUnadjustedEndDate();
+        return endDate.equals(firstCouponDate) ? endDate.plus(bond.getFrequency()) : endDate;
+      }
+
+      @Override
+      public Frequency getFrequency() {
+        return bond.getFrequency();
+      }
+
+      @Override
+      public LocalDate getPeriodEndDate(LocalDate date) {
+        return firstCouponDate;
+      }
+
+      @Override
+      public boolean isEndOfMonthConvention() {
+        return bond.getRollConvention() == RollConventions.EOM;
+      }
+    };
+    return bond.getDayCount().yearFraction(settlementDate, bond.getUnadjustedStartDate(), info);
   }
 
   private int couponIndex(ImmutableList<FixedCouponBondPaymentPeriod> list, LocalDate date) {
